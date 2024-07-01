@@ -1,22 +1,18 @@
-use std::{
-    collections::{BTreeMap, HashSet},
-    io::Write,
-};
+use std::{collections::BTreeMap, io::Write};
 
 use ratatui::{
-    backend::Backend,
     style::Style,
-    widgets::{
-        block::{Position, Title},
-        Block, Borders, Widget,
-    },
-    Terminal,
+    text::Line,
+    widgets::{Block, Borders, Widget},
 };
 use tracing::debug;
 use tui_term::widget::PseudoTerminal;
 use turborepo_vt100 as vt100;
 
 use super::{app::Direction, Error};
+
+const FOOTER_TEXT_ACTIVE: &str = "Press`Ctrl-Z` to stop interacting.";
+const FOOTER_TEXT_INACTIVE: &str = "Press `Enter` to interact.";
 
 pub struct TerminalPane<W> {
     tasks: BTreeMap<String, TerminalOutput<W>>,
@@ -31,7 +27,7 @@ struct TerminalOutput<W> {
     cols: u16,
     parser: vt100::Parser,
     stdin: Option<W>,
-    has_been_persisted: bool,
+    status: Option<String>,
 }
 
 impl<W> TerminalPane<W> {
@@ -100,6 +96,12 @@ impl<W> TerminalPane<W> {
         Ok(())
     }
 
+    pub fn set_status(&mut self, task: &str, status: String) -> Result<(), Error> {
+        let task = self.task_mut(task)?;
+        task.status = Some(status);
+        Ok(())
+    }
+
     pub fn scroll(&mut self, task: &str, direction: Direction) -> Result<(), Error> {
         let task = self.task_mut(task)?;
         let scrollback = task.parser.screen().scrollback();
@@ -111,24 +113,14 @@ impl<W> TerminalPane<W> {
         Ok(())
     }
 
-    pub fn render_screen<B: Backend>(
-        &mut self,
-        task_name: &str,
-        terminal: &mut Terminal<B>,
-    ) -> Result<(), Error> {
-        let task = self.task_mut(task_name)?;
-        task.persist_screen(task_name, terminal)
-    }
-
-    pub fn render_remaining<B: Backend>(
-        &mut self,
-        started_tasks: HashSet<&str>,
-        terminal: &mut Terminal<B>,
-    ) -> Result<(), Error> {
-        for (task_name, task) in self.tasks.iter_mut() {
-            if !task.has_been_persisted && started_tasks.contains(task_name.as_str()) {
-                task.persist_screen(task_name, terminal)?;
-            }
+    /// Persist all task output to the terminal
+    pub fn persist_tasks(&mut self, started_tasks: &[&str]) -> std::io::Result<()> {
+        for (task_name, task) in started_tasks
+            .iter()
+            .copied()
+            .filter_map(|started_task| (Some(started_task)).zip(self.tasks.get(started_task)))
+        {
+            task.persist_screen(task_name)?;
         }
         Ok(())
     }
@@ -176,7 +168,14 @@ impl<W> TerminalOutput<W> {
             stdin,
             rows,
             cols,
-            has_been_persisted: false,
+            status: None,
+        }
+    }
+
+    fn title(&self, task_name: &str) -> String {
+        match self.status.as_deref() {
+            Some(status) => format!(" {task_name} > {status} "),
+            None => format!(" {task_name} > "),
         }
     }
 
@@ -188,25 +187,20 @@ impl<W> TerminalOutput<W> {
         self.cols = cols;
     }
 
-    fn persist_screen<B: Backend>(
-        &mut self,
-        task_name: &str,
-        terminal: &mut Terminal<B>,
-    ) -> Result<(), Error> {
+    #[tracing::instrument(skip(self))]
+    fn persist_screen(&self, task_name: &str) -> std::io::Result<()> {
         let screen = self.parser.entire_screen();
-        let (rows, _) = screen.size();
-        let mut cursor = tui_term::widget::Cursor::default();
-        cursor.hide();
-        let title = format!(" {task_name} >");
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title.as_str())
-            .title(Title::from(title.as_str()).position(Position::Bottom));
-        let term = PseudoTerminal::new(&screen).cursor(cursor).block(block);
-        terminal.insert_before((rows as u16).saturating_add(2), |buf| {
-            term.render(buf.area, buf)
-        })?;
-        self.has_been_persisted = true;
+        let title = self.title(task_name);
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all("┌".as_bytes())?;
+        stdout.write_all(title.as_bytes())?;
+        stdout.write_all(b"\r\n")?;
+        for row in screen.rows_formatted(0, self.cols) {
+            stdout.write_all("│ ".as_bytes())?;
+            stdout.write_all(&row)?;
+            stdout.write_all(b"\r\n")?;
+        }
+        stdout.write_all("└────>\r\n".as_bytes())?;
 
         Ok(())
     }
@@ -222,10 +216,13 @@ impl<W> Widget for &TerminalPane<W> {
         };
         let screen = task.parser.screen();
         let mut block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {task_name} >"));
+            .borders(Borders::LEFT)
+            .title(task.title(task_name));
         if self.highlight {
+            block = block.title_bottom(Line::from(FOOTER_TEXT_ACTIVE).centered());
             block = block.border_style(Style::new().fg(ratatui::style::Color::Yellow));
+        } else {
+            block = block.title_bottom(Line::from(FOOTER_TEXT_INACTIVE).centered());
         }
         let term = PseudoTerminal::new(screen).block(block);
         term.render(area, buf)
@@ -237,7 +234,7 @@ mod test {
     // Used by assert_buffer_eq
     #[allow(unused_imports)]
     use indoc::indoc;
-    use ratatui::{assert_buffer_eq, buffer::Buffer, layout::Rect, style::Style};
+    use ratatui::{assert_buffer_eq, buffer::Buffer, layout::Rect};
 
     use super::*;
 
@@ -256,12 +253,12 @@ mod test {
         assert_buffer_eq!(
             buffer,
             Buffer::with_lines(vec![
-                "┌ foo >┐",
-                "│3     │",
-                "│4     │",
-                "│5     │",
-                "│█     │",
-                "└──────┘",
+                "│ foo > ",
+                "│3      ",
+                "│4      ",
+                "│5      ",
+                "│█      ",
+                "│Press `",
             ])
         );
     }
