@@ -54,7 +54,7 @@ convert_case = "0.6.0"
 crossterm = "0.26"
 ctrlc = { version = "3.4.0", features = ["termination"] }
 derive_setters = { workspace = true }
-dialoguer = { workspace = true, features = ["fuzzy-select"] }
+dialoguer = { workspace = true, features = ["fuzzy-select", "password"] }
 dirs-next = "2.0.0"
 dunce = { workspace = true }
 either = { workspace = true }
@@ -155,7 +155,7 @@ uds_windows = "1.0.2"
 async-io = "1.12.0"
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
-winapi = "0.3.9"
+windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
 
 [build-dependencies]
 capnpc = "0.18.0"
